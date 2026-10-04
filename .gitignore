@@ -1,0 +1,24 @@
+# Python 快取檔案
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 打包產生的暫存與輸出資料夾
+build/
+dist/
+*.spec
+
+# FFmpeg 轉檔核心 (二進位大檔案，不建議進 Git)
+ffmpeg.exe
+ffprobe.exe
+
+# 應用程式自動產生的設定檔 (長輩個人設定)
+EasyConverterSettings.json
+
+# 錯誤報告與日誌
+轉檔失敗清單_*.txt
+*.log
+
+# 系統暫存檔案
+.DS_Store
+Thumbs.db
