@@ -435,7 +435,7 @@ class AppUI(tk.Tk):
         main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True)
 
-        # 左側：清單
+        # 左側：日誌區
         left_frame = ttk.Frame(main_paned)
         main_paned.add(left_frame, weight=3)
 
@@ -452,24 +452,12 @@ class AppUI(tk.Tk):
         ttk.Button(btn_frame2, text="📁 加入整個資料夾", command=self.add_folder).pack(fill=tk.X)
         ttk.Label(btn_frame2, text="*自動找出所有影音檔", foreground="gray", font=self.small_font, anchor="center").pack()
 
-        btn_frame3 = ttk.Frame(list_toolbar)
-        btn_frame3.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(btn_frame3, text="🗑️ 移除選取項目", command=self.remove_selected).pack(fill=tk.X)
-        ttk.Label(btn_frame3, text="*或選取後按 Delete 鍵", foreground="gray", font=self.small_font, anchor="center").pack()
-
-        columns = ("path", "status")
-        self.tree = ttk.Treeview(left_frame, columns=columns, show="headings", selectmode="extended")
-        self.tree.heading("path", text="檔案路徑")
-        self.tree.heading("status", text="狀態")
-        self.tree.column("path", width=400)
-        self.tree.column("status", width=100, anchor=tk.CENTER)
+        self.log_text = tk.Text(left_frame, state='disabled', wrap='word', font=self.custom_font)
+        scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
         
-        scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
-        
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<Delete>", lambda e: self.remove_selected())
 
         # 右側：設定與控制
         right_frame = ttk.Frame(main_paned)
@@ -552,6 +540,12 @@ class AppUI(tk.Tk):
                         path = os.path.join(root, file)
                         self.add_to_list(path, base_dir=folder)
 
+    def append_log(self, text):
+        self.log_text.config(state='normal')
+        self.log_text.insert(tk.END, text + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.config(state='disabled')
+
     def add_to_list(self, path, base_dir=None):
         # 避免重複
         for existing in self.file_list:
@@ -561,14 +555,8 @@ class AppUI(tk.Tk):
         item_id = f"item_{self.item_counter}"
         self.item_counter += 1
         
-        self.file_list.append({'id': item_id, 'path': path, 'base_dir': base_dir})
-        self.tree.insert("", tk.END, iid=item_id, values=(path, "等待中"))
-
-    def remove_selected(self):
-        selected = self.tree.selection()
-        for iid in selected:
-            self.tree.delete(iid)
-            self.file_list = [item for item in self.file_list if item['id'] != iid]
+        self.file_list.append({'id': item_id, 'path': path, 'base_dir': base_dir, 'status': '等待中'})
+        self.append_log(f"已加入檔案: {os.path.basename(path)}")
 
     def select_out_dir(self):
         d = filedialog.askdirectory(title="選擇儲存資料夾")
@@ -585,15 +573,71 @@ class AppUI(tk.Tk):
             messagebox.showwarning("提示", "請先選擇儲存位置！")
             return
 
+        self.show_confirmation_dialog()
+
+    def show_confirmation_dialog(self):
+        top = tk.Toplevel(self)
+        top.title("二次確認 - 待轉檔清單")
+        top.geometry("800x500")
+        top.transient(self)
+        top.grab_set()
+
+        # Toolbar in dialog
+        toolbar = ttk.Frame(top)
+        toolbar.pack(fill=tk.X, padx=10, pady=5)
+        
+        # Treeview in dialog
+        columns = ("path", "status")
+        tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended")
+        tree.heading("path", text="檔案路徑")
+        tree.heading("status", text="狀態")
+        tree.column("path", width=600)
+        tree.column("status", width=100, anchor=tk.CENTER)
+        
+        scrollbar = ttk.Scrollbar(top, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scrollbar.set)
+        
+        tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def remove_selected_from_dialog(event=None):
+            selected = tree.selection()
+            for iid in selected:
+                tree.delete(iid)
+                self.file_list = [item for item in self.file_list if item['id'] != iid]
+                
+        ttk.Button(toolbar, text="🗑️ 移除選取項目", command=remove_selected_from_dialog).pack(side=tk.LEFT)
+        tree.bind("<Delete>", remove_selected_from_dialog)
+        
+        # Populate tree
+        for item in self.file_list:
+            tree.insert("", tk.END, iid=item['id'], values=(item['path'], item.get('status', '等待中')))
+
+        def on_confirm():
+            top.destroy()
+            self._execute_conversion()
+
+        # Bottom buttons
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(fill=tk.X, pady=10)
+        ttk.Button(btn_frame, text="✅ 確認並開始轉檔", command=on_confirm).pack(side=tk.RIGHT, padx=10)
+        ttk.Button(btn_frame, text="❌ 取消", command=top.destroy).pack(side=tk.RIGHT, padx=10)
+
+    def _execute_conversion(self):
+        if not self.file_list:
+            self.append_log("轉檔清單為空，已取消轉檔。")
+            return
+
         self.save_settings()
         self.btn_start.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         self.btn_retry.config(state=tk.DISABLED)
         
         for item in self.file_list:
-            self.tree.set(item['id'], "status", "處理中...")
+            item['status'] = "處理中..."
         
         self.status_var.set("轉檔中，請稍候...")
+        self.append_log("\n=== 開始轉檔 ===")
         
         actual_format = self.format_var.get()
         if actual_format == "advanced":
@@ -614,17 +658,22 @@ class AppUI(tk.Tk):
 
     def _process_update(self, msg_type, content):
         if msg_type == "SUCCESS":
-            self.tree.delete(content) # 成功則移出清單
+            path = next((item['path'] for item in self.file_list if item['id'] == content), content)
+            self.append_log(f"✅ 成功: {os.path.basename(path)}")
             self.file_list = [item for item in self.file_list if item['id'] != content]
         elif msg_type == "FAIL":
-            self.tree.set(content, "status", "❌ 失敗")
-            self.tree.item(content, tags=("failed",))
-            self.tree.tag_configure("failed", foreground="red")
+            path = next((item['path'] for item in self.file_list if item['id'] == content), content)
+            self.append_log(f"❌ 失敗: {os.path.basename(path)}")
+            for item in self.file_list:
+                if item['id'] == content:
+                    item['status'] = '❌ 失敗'
         elif msg_type == "PROGRESS":
             self.status_var.set(f"轉檔進度: {content}")
         elif msg_type == "ERROR":
+            self.append_log(f"⚠️ 錯誤: {content}")
             messagebox.showerror("錯誤", content)
         elif msg_type == "PAUSE_REQUEST":
+            self.append_log(f"⏸️ 發生 I/O 錯誤，暫停中: {content}")
             self.show_io_error_dialog(content)
 
     def show_io_error_dialog(self, msg):
@@ -684,20 +733,13 @@ class AppUI(tk.Tk):
             pass
 
     def retry_failed(self):
-        # 僅保留有 "failed" tag 的
-        retry_list = []
-        for iid in self.tree.get_children():
-            if self.tree.set(iid, "status") == "❌ 失敗":
-                for item in self.file_list:
-                    if item['id'] == iid:
-                        retry_list.append(item)
-                        break
+        retry_list = [item for item in self.file_list if item.get('status') == '❌ 失敗']
         
         self.file_list = retry_list
         for item in self.file_list:
-            self.tree.set(item['id'], "status", "等待重試")
+            item['status'] = '等待重試'
             
-        self.start_conversion()
+        self.show_confirmation_dialog()
 
     def on_closing(self):
         if not self.btn_start.instate(['!disabled']): # 正在轉檔
