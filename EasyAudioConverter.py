@@ -10,6 +10,7 @@ import ctypes
 from ctypes import wintypes
 from pathlib import Path
 import tempfile
+import uuid
 import tkinter as tk
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -212,6 +213,9 @@ class ConverterEngine:
         if not FileUtils.is_file_accessible(src_path):
             return False, "無法讀取 (可能被佔用或權限不足)"
         
+        if Path(src_path).suffix.lower() == out_format.lower() and not auto_vol:
+            return True, "格式相同已略過"
+        
         src_name = Path(src_path).stem
         original_safe_name = FileUtils.sanitize_filename(src_name)
         safe_name = original_safe_name + out_format
@@ -348,7 +352,7 @@ class ConverterEngine:
                         self.ui_callback("FAIL", (item['id'], msg))
                 except Exception as e:
                     self.failed_list.append((item['path'], str(e)))
-                    self.ui_callback("FAIL", (item['id'], msg))
+                    self.ui_callback("FAIL", (item['id'], str(e)))
                 
                 processed += 1
                 self.ui_callback("PROGRESS", (processed, self.total_count))
@@ -623,8 +627,14 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         item_id = f"item_{self.item_counter}"
         self.item_counter += 1
         
-        self.file_list.append({'id': item_id, 'path': path, 'base_dir': base_dir, 'status': '等待中'})
-        self.append_log(f"已加入檔案: {os.path.basename(path)}")
+        try:
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            size_str = f"{size_mb:.2f} MB"
+        except Exception:
+            size_str = "未知"
+            
+        self.file_list.append({'id': item_id, 'path': path, 'base_dir': base_dir, 'status': '等待中', 'size': size_str})
+        self.append_log(f"已加入檔案: {os.path.basename(path)} ({size_str})")
 
     def select_out_dir(self):
         d = filedialog.askdirectory(title="選擇儲存資料夾")
