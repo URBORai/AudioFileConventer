@@ -747,7 +747,10 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         elif msg_type == "SUCCESS":
             item_id, msg = content
             path = next((item['path'] for item in self.file_list if item['id'] == item_id), item_id)
-            self.append_log(f"[成功] {os.path.basename(path)}")
+            if msg == "格式相同已略過":
+                self.append_log(f"[略過] {os.path.basename(path)} - 格式相同")
+            else:
+                self.append_log(f"[成功] {os.path.basename(path)}")
             self.file_list = [item for item in self.file_list if item['id'] != item_id]
         elif msg_type == "FAIL":
             item_id, msg = content
