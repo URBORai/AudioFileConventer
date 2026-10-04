@@ -1,6 +1,7 @@
-import os
+﻿import os
 import sys
 import time
+import datetime
 import shutil
 import subprocess
 import threading
@@ -10,8 +11,13 @@ from ctypes import wintypes
 from pathlib import Path
 import tempfile
 import tkinter as tk
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+    has_dnd = True
+except ImportError:
+    has_dnd = False
 from tkinter import ttk, filedialog, messagebox, font
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ========== 全域常數與系統設定 ==========
 SETTINGS_FILE = "EasyConverterSettings.json"
@@ -147,6 +153,18 @@ class FileUtils:
         return filename
 
     @staticmethod
+    @staticmethod
+    def format_size(size_bytes):
+        if size_bytes == 0:
+            return "0 B"
+        size_name = ("B", "KB", "MB", "GB", "TB")
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_name[i]}"
+
+    @staticmethod
     def get_ffmpeg_path():
         """取得 FFmpeg 路徑 (支援 PyInstaller 打包)"""
         return FileUtils.get_resource_path('ffmpeg.exe'), FileUtils.get_resource_path('ffprobe.exe')
@@ -187,23 +205,18 @@ class ConverterEngine:
         if stop_event.is_set():
             return False, "已取消"
         
-        # 阻塞等待暫停恢復
+        self.ui_callback("START", item['id'])
         pause_event.wait()
 
         src_path = item['path']
         if not FileUtils.is_file_accessible(src_path):
-            return False, "無法讀取 (可能被鎖定或雲端未下載)"
+            return False, "無法讀取 (可能被佔用或權限不足)"
         
-        duration = self.get_media_duration(src_path)
-        if duration <= 0:
-            return False, "檔案毀損或具備 DRM 版權保護"
-
-        # 決定輸出路徑
         src_name = Path(src_path).stem
-        safe_name = FileUtils.sanitize_filename(src_name) + out_format
+        original_safe_name = FileUtils.sanitize_filename(src_name)
+        safe_name = original_safe_name + out_format
         
         if base_src_dir and src_path.startswith(base_src_dir):
-            # 樹狀結構重建
             rel_path = os.path.relpath(os.path.dirname(src_path), base_src_dir)
             if rel_path == '.':
                 final_out_dir = base_out_dir
@@ -215,27 +228,26 @@ class ConverterEngine:
         try:
             os.makedirs(final_out_dir, exist_ok=True)
         except Exception as e:
-            self._trigger_io_pause(f"無法建立資料夾 {final_out_dir}\n請檢查隨身碟是否斷線！\n{str(e)}")
+            self._trigger_io_pause(f"無法建立資料夾 {final_out_dir}\n檢查是否為磁碟機斷線！\n{str(e)}")
             return False, "I/O 錯誤"
 
         final_out_path = os.path.join(final_out_dir, safe_name)
-        
-        # 防呆：MAX_PATH
         if len(final_out_path) > MAX_PATH_LEN:
-            final_out_path = os.path.join(base_out_dir, safe_name) # 展平路徑
+            final_out_path = os.path.join(base_out_dir, safe_name)
             if len(final_out_path) > MAX_PATH_LEN:
-                safe_name = safe_name[:50] + out_format
+                original_safe_name = original_safe_name[:50]
+                safe_name = original_safe_name + out_format
                 final_out_path = os.path.join(base_out_dir, safe_name)
 
-        # 智慧續傳
-        if os.path.exists(final_out_path) and os.path.getsize(final_out_path) > 0:
-            return True, "已存在，跳過"
+        counter = 1
+        while os.path.exists(final_out_path):
+            safe_name = f"{original_safe_name} ({counter}){out_format}"
+            final_out_path = os.path.join(final_out_dir, safe_name)
+            counter += 1
 
-        # 本機快取再搬移
         temp_dir = tempfile.gettempdir()
-        temp_out = os.path.join(temp_dir, f"temp_conv_{int(time.time())}_{threading.get_ident()}{out_format}")
+        temp_out = os.path.join(temp_dir, f"temp_conv_{uuid.uuid4().hex}{out_format}")
 
-        # 組裝 FFmpeg 參數
         cmd = [self.ffmpeg, "-y", "-i", src_path, "-vn", "-map_metadata", "0"]
         if auto_vol:
             cmd.extend(["-af", "loudnorm=I=-16:TP=-1.5:LRA=11"])
@@ -252,42 +264,42 @@ class ConverterEngine:
             cmd.extend(["-c:a", "libvorbis", "-q:a", "5"])
         elif out_format == ".wma":
             cmd.extend(["-c:a", "wmav2", "-b:a", "192k"])
-            
-        cmd.append(temp_out)
 
+        cmd.append(temp_out)
+        move_success = False
         try:
-            # 使用 BELOW_NORMAL_PRIORITY_CLASS 確保不卡死系統
-            proc = subprocess.Popen(cmd, creationflags=BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            proc.communicate()
+            proc = subprocess.Popen(cmd, creationflags=BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='ignore')
+            while True:
+                if stop_event.is_set():
+                    proc.terminate()
+                    proc.wait()
+                    return False, "已取消"
+                try:
+                    out, err = proc.communicate(timeout=0.5)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             
             if proc.returncode != 0:
-                return False, "轉檔核心回報錯誤"
+                return False, "轉檔引擎回報錯誤"
 
-            # 雙重校驗
-            if not os.path.exists(temp_out) or os.path.getsize(temp_out) < 10240: # < 10KB
-                return False, "產出檔案過小或異常"
+            if not os.path.exists(temp_out):
+                return False, "無法產生檔案 (來源檔損毀或不含音軌)"
             
-            out_duration = self.get_media_duration(temp_out)
-            if out_duration < 0.5:
-                return False, "產出音訊長度不足"
-
-            # 繼承時間戳記
             stat = os.stat(src_path)
             WinAPIUtils.set_file_times(temp_out, stat.st_ctime, stat.st_mtime, stat.st_atime)
 
-            # 搬移至最終目標
-            pause_event.wait() # 搬移前再確認一次沒有被全域暫停
+            pause_event.wait()
             shutil.move(temp_out, final_out_path)
-            
+            move_success = True
             return True, "成功"
-
         except Exception as e:
             if "No such file or directory" in str(e) or "Permission denied" in str(e):
-                self._trigger_io_pause(f"存取異常，請檢查隨身碟/硬碟是否鬆脫！\n錯誤: {e}")
+                self._trigger_io_pause(f"來源異常，檢查是否已斷線\n錯誤: {e}")
                 return False, "I/O 斷線"
             return False, str(e)
         finally:
-            if os.path.exists(temp_out):
+            if not move_success and os.path.exists(temp_out):
                 try:
                     os.remove(temp_out)
                 except:
@@ -303,7 +315,7 @@ class ConverterEngine:
         WinAPIUtils.prevent_sleep()
 
         # 自動偵測核心數，保留1~2核
-        max_workers = max(1, os.cpu_count() - 1)
+        max_workers = getattr(self, "max_workers", max(1, int((os.cpu_count() or 1) * 0.75)))
 
         # 估算所需空間 (1.5倍)
         total_size = sum(os.path.getsize(f['path']) for f in file_list if os.path.exists(f['path']))
@@ -330,16 +342,16 @@ class ConverterEngine:
                     success, msg = future.result()
                     if success:
                         self.success_count += 1
-                        self.ui_callback("SUCCESS", item['id'])
+                        self.ui_callback("SUCCESS", (item['id'], msg))
                     else:
                         self.failed_list.append((item['path'], msg))
-                        self.ui_callback("FAIL", item['id'])
+                        self.ui_callback("FAIL", (item['id'], msg))
                 except Exception as e:
                     self.failed_list.append((item['path'], str(e)))
-                    self.ui_callback("FAIL", item['id'])
+                    self.ui_callback("FAIL", (item['id'], msg))
                 
                 processed += 1
-                self.ui_callback("PROGRESS", f"{processed}/{self.total_count}")
+                self.ui_callback("PROGRESS", (processed, self.total_count))
 
         WinAPIUtils.allow_sleep()
         
@@ -354,7 +366,7 @@ class ConverterEngine:
 
 
 # ========== 使用者介面 ==========
-class AppUI(tk.Tk):
+class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
     def __init__(self):
         super().__init__()
         WinAPIUtils.setup_dpi_awareness()
@@ -391,8 +403,12 @@ class AppUI(tk.Tk):
         self.file_list = []
         self.item_counter = 0
         self.settings = self.load_settings()
+        self.max_workers = self.settings.get('max_workers', max(1, int((os.cpu_count() or 1) * 0.75)))
 
         self.setup_ui()
+        if has_dnd:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self.on_drop)
         self.engine = ConverterEngine(self.on_engine_update, self.on_engine_finish)
 
         if not self.engine.check_ffmpeg_exists():
@@ -423,58 +439,46 @@ class AppUI(tk.Tk):
             pass
 
     def setup_ui(self):
-        # 頂部工具列
         top_frame = ttk.Frame(self)
-        top_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        ttk.Label(top_frame, text="放大/縮小介面：").pack(side=tk.LEFT)
-        ttk.Button(top_frame, text="➕ 放大", command=lambda: self.adjust_font(2)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(top_frame, text="➖ 縮小", command=lambda: self.adjust_font(-2)).pack(side=tk.LEFT, padx=5)
+        top_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(top_frame, text="字體大小:").pack(side=tk.LEFT, padx=(10, 0))
+        ttk.Button(top_frame, text="放大", command=lambda: self.adjust_font(2)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="縮小", command=lambda: self.adjust_font(-2)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(top_frame, text="⚙️ 設定", command=self.open_settings).pack(side=tk.RIGHT, padx=10)
 
-        # 主畫面分割
-        main_paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
-        main_paned.pack(fill=tk.BOTH, expand=True)
+        main_paned = ttk.PanedWindow(self, orient=tk.VERTICAL)
+        main_paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        # 左側：日誌區
-        left_frame = ttk.Frame(main_paned)
-        main_paned.add(left_frame, weight=3)
+        controls_frame = ttk.Frame(main_paned)
+        main_paned.add(controls_frame, weight=1)
 
-        list_toolbar = ttk.Frame(left_frame)
-        list_toolbar.pack(fill=tk.X, pady=5)
-        
-        btn_frame1 = ttk.Frame(list_toolbar)
+        left_col = ttk.Frame(controls_frame)
+        left_col.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+        right_col = ttk.Frame(controls_frame)
+        right_col.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        add_group = ttk.LabelFrame(left_col, text="第一步：選擇檔案", padding=10)
+        add_group.pack(fill=tk.X, pady=(0, 10))
+        btn_frame1 = ttk.Frame(add_group)
         btn_frame1.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(btn_frame1, text="📂 加入影音檔案", command=self.add_files).pack(fill=tk.X)
-        ttk.Label(btn_frame1, text="*可一次選取多個檔案", foreground="gray", font=self.small_font, anchor="center").pack()
+        ttk.Button(btn_frame1, text="加入影音檔案", command=self.add_files).pack(fill=tk.X, ipady=5)
+        ttk.Label(btn_frame1, text="*可拖曳或多選", foreground="gray", font=self.small_font, anchor="center").pack()
 
-        btn_frame2 = ttk.Frame(list_toolbar)
+        btn_frame2 = ttk.Frame(add_group)
         btn_frame2.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=2)
-        ttk.Button(btn_frame2, text="📁 加入整個資料夾", command=self.add_folder).pack(fill=tk.X)
-        ttk.Label(btn_frame2, text="*自動找出所有影音檔", foreground="gray", font=self.small_font, anchor="center").pack()
+        ttk.Button(btn_frame2, text="加入整個資料夾", command=self.add_folder).pack(fill=tk.X, ipady=5)
+        ttk.Label(btn_frame2, text="*自動找出所有影音", foreground="gray", font=self.small_font, anchor="center").pack()
 
-        self.log_text = tk.Text(left_frame, state='disabled', wrap='word', font=self.custom_font)
-        scrollbar = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-        
-        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # 右側：設定與控制
-        right_frame = ttk.Frame(main_paned)
-        main_paned.add(right_frame, weight=2)
-
-        # 輸出位置
-        out_group = ttk.LabelFrame(right_frame, text="儲存位置", padding=10)
-        out_group.pack(fill=tk.X, pady=10, padx=10)
+        out_group = ttk.LabelFrame(left_col, text="第二步：儲存位置", padding=10)
+        out_group.pack(fill=tk.X, pady=(0, 10))
         self.out_dir_var = tk.StringVar(value=self.settings.get("out_dir", ""))
-        ttk.Entry(out_group, textvariable=self.out_dir_var, state="readonly").pack(fill=tk.X, pady=5)
-        ttk.Button(out_group, text="更改儲存資料夾", command=self.select_out_dir).pack(fill=tk.X)
-        ttk.Label(out_group, text="*轉檔完成後的音樂會存放在這裡", foreground="gray", font=self.small_font).pack(anchor=tk.W, pady=(5,0))
+        out_entry_frame = ttk.Frame(out_group)
+        out_entry_frame.pack(fill=tk.X)
+        ttk.Entry(out_entry_frame, textvariable=self.out_dir_var, state="readonly").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        ttk.Button(out_entry_frame, text="瀏覽...", command=self.select_out_dir, width=8).pack(side=tk.RIGHT)
 
-        # 格式與功能
-        fmt_group = ttk.LabelFrame(right_frame, text="轉檔設定", padding=10)
-        fmt_group.pack(fill=tk.X, pady=10, padx=10)
-        
+        fmt_group = ttk.LabelFrame(left_col, text="第三步：格式設定", padding=10)
+        fmt_group.pack(fill=tk.X)
         self.format_var = tk.StringVar(value=self.settings.get("format", ".mp3"))
         
         def on_format_change():
@@ -483,37 +487,101 @@ class AppUI(tk.Tk):
             else:
                 self.adv_combo.config(state=tk.DISABLED)
 
-        ttk.Radiobutton(fmt_group, text="轉成 MP3 (一般)", variable=self.format_var, value=".mp3", command=on_format_change).pack(anchor=tk.W, pady=(5,0))
-        ttk.Label(fmt_group, text="*最通用的格式，所有手機/隨身碟都支援", foreground="gray", font=self.small_font).pack(anchor=tk.W, padx=25)
-
-        ttk.Radiobutton(fmt_group, text="轉成 WAV (無損)", variable=self.format_var, value=".wav", command=on_format_change).pack(anchor=tk.W, pady=(5,0))
-        ttk.Label(fmt_group, text="*音質最好，但檔案容量非常大", foreground="gray", font=self.small_font).pack(anchor=tk.W, padx=25)
+        ttk.Radiobutton(fmt_group, text="轉成 MP3 (最通用)", variable=self.format_var, value=".mp3", command=on_format_change).pack(anchor=tk.W)
+        ttk.Radiobutton(fmt_group, text="轉成 WAV (無損音質)", variable=self.format_var, value=".wav", command=on_format_change).pack(anchor=tk.W, pady=5)
         
         adv_frame = ttk.Frame(fmt_group)
-        adv_frame.pack(anchor=tk.W, fill=tk.X, pady=(5,0))
-        ttk.Radiobutton(adv_frame, text="其他格式：", variable=self.format_var, value="advanced", command=on_format_change).pack(side=tk.LEFT)
-        
+        adv_frame.pack(anchor=tk.W, fill=tk.X)
+        ttk.Radiobutton(adv_frame, text="其他格式:", variable=self.format_var, value="advanced", command=on_format_change).pack(side=tk.LEFT)
         self.adv_format_var = tk.StringVar(value=self.settings.get("adv_format", ".aac"))
         self.adv_combo = ttk.Combobox(adv_frame, textvariable=self.adv_format_var, values=[".aac", ".m4a", ".flac", ".ogg", ".wma"], width=6)
-        self.adv_combo.pack(side=tk.LEFT, padx=2)
-        on_format_change() # 初始化狀態
-
+        self.adv_combo.pack(side=tk.LEFT, padx=5)
+        on_format_change()
         self.vol_var = tk.IntVar(value=self.settings.get("auto_vol", 0))
-        ttk.Checkbutton(fmt_group, text="自動放大音量", variable=self.vol_var).pack(anchor=tk.W, pady=(15,0))
-        ttk.Label(fmt_group, text="*原本影片聲音太小的話，打勾會自動增強", foreground="gray", font=self.small_font).pack(anchor=tk.W, padx=25)
+        ttk.Checkbutton(fmt_group, text="自動增強音量", variable=self.vol_var).pack(anchor=tk.W, pady=(10,0))
 
-        # 狀態區
-        self.status_var = tk.StringVar(value="準備就緒")
-        ttk.Label(right_frame, textvariable=self.status_var, foreground="blue").pack(pady=20)
+        action_group = ttk.LabelFrame(right_col, text="執行區", padding=20)
+        action_group.pack(fill=tk.BOTH, expand=True)
+        self.status_var = tk.StringVar(value="準備就緒，請先加入檔案")
+        status_label = ttk.Label(action_group, textvariable=self.status_var, foreground="blue", font=self.custom_font, anchor="center")
+        status_label.pack(fill=tk.X, pady=(10, 10))
+        self.progress_var = tk.DoubleVar(value=0)
+        self.progress_bar = ttk.Progressbar(action_group, variable=self.progress_var, maximum=100)
+        self.progress_bar.pack(fill=tk.X, pady=(0, 30))
+        self.btn_start = ttk.Button(action_group, text="開始轉檔", command=self.start_conversion)
+        self.btn_start.pack(fill=tk.X, pady=5, ipady=15)
+        self.btn_stop = ttk.Button(action_group, text="停止轉檔", command=self.stop_conversion, state=tk.DISABLED)
+        self.btn_stop.pack(fill=tk.X, pady=5, ipady=10)
+        self.btn_retry = ttk.Button(action_group, text="重試失敗項目", command=self.retry_failed, state=tk.DISABLED)
+        self.btn_retry.pack(fill=tk.X, pady=5)
 
-        self.btn_start = ttk.Button(right_frame, text="▶️ 開始轉檔", command=self.start_conversion)
-        self.btn_start.pack(fill=tk.X, padx=10, pady=5, ipady=15)
+        log_frame = ttk.LabelFrame(main_paned, text="詳細執行紀錄 (Log)")
+        main_paned.add(log_frame, weight=1)
+        self.log_text = tk.Text(log_frame, state='disabled', wrap='word', font=self.custom_font, height=8)
+        scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=scrollbar.set)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=5)
 
-        self.btn_stop = ttk.Button(right_frame, text="⏹️ 停止/取消", command=self.stop_conversion, state=tk.DISABLED)
-        self.btn_stop.pack(fill=tk.X, padx=10, pady=5, ipady=15)
-        
-        self.btn_retry = ttk.Button(right_frame, text="🔄 重試失敗項目", command=self.retry_failed, state=tk.DISABLED)
-        self.btn_retry.pack(fill=tk.X, padx=10, pady=5)
+    
+    def open_settings(self):
+        try:
+            top = tk.Toplevel(self)
+            top.title("效能設定")
+            top.geometry("450x300")
+            top.transient(self)
+            top.grab_set()
+            
+            ttk.Label(top, text="選擇運作模式或手動調整核心數：", font=self.custom_font).pack(pady=(15,5))
+            
+            max_c = os.cpu_count() or 4
+            var = tk.IntVar(value=int(self.max_workers))
+            
+            mode_frame = ttk.Frame(top)
+            mode_frame.pack(fill=tk.X, padx=20, pady=5)
+            
+            def set_preset(val):
+                var.set(val)
+                lbl.config(text=f"{val} 核心")
+                
+            ttk.Button(mode_frame, text="安靜 (25%)", command=lambda: set_preset(max(1, int(max_c * 0.25)))).pack(side=tk.LEFT, expand=True, padx=2)
+            ttk.Button(mode_frame, text="平衡 (50%)", command=lambda: set_preset(max(1, int(max_c * 0.5)))).pack(side=tk.LEFT, expand=True, padx=2)
+            ttk.Button(mode_frame, text="效能 (75%)", command=lambda: set_preset(max(1, int(max_c * 0.75)))).pack(side=tk.LEFT, expand=True, padx=2)
+            ttk.Button(mode_frame, text="滿速 (100%)", command=lambda: set_preset(max_c)).pack(side=tk.LEFT, expand=True, padx=2)
+            
+            scale = tk.Scale(top, from_=1, to=max_c, orient=tk.HORIZONTAL, variable=var, length=300)
+            scale.pack(fill=tk.X, padx=20, pady=(15, 0))
+            
+            lbl = ttk.Label(top, text=f"{var.get()} 核心", font=self.custom_font)
+            lbl.pack(pady=5)
+            
+            def on_change(*args):
+                lbl.config(text=f"{var.get()} 核心")
+            var.trace_add("write", on_change)
+            
+            def save():
+                self.max_workers = var.get()
+                self.settings["max_workers"] = self.max_workers
+                self.save_settings()
+                top.destroy()
+                
+            ttk.Button(top, text="儲存設定", command=save, padding=5).pack(pady=10)
+        except Exception as e:
+            import traceback
+            with open('debug_settings.txt', 'w') as df:
+                traceback.print_exc(file=df)
+
+    def on_drop(self, event):
+        files = self.tk.splitlist(event.data)
+        for f in files:
+            if os.path.isdir(f):
+                for root, _, _files in os.walk(f):
+                    for _file in _files:
+                        if Path(_file).suffix.lower() in SUPPORTED_EXTS:
+                            self.add_to_list(os.path.join(root, _file), base_dir=f)
+            else:
+                if Path(f).suffix.lower() in SUPPORTED_EXTS:
+                    self.add_to_list(f)
 
     def adjust_font(self, delta):
         new_size = self.base_font_size + delta
@@ -582,17 +650,18 @@ class AppUI(tk.Tk):
         top.transient(self)
         top.grab_set()
 
-        # Toolbar in dialog
         toolbar = ttk.Frame(top)
         toolbar.pack(fill=tk.X, padx=10, pady=5)
         
-        # Treeview in dialog
-        columns = ("path", "status")
+        columns = ("path", "size", "status")
         tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended")
         tree.heading("path", text="檔案路徑")
+        tree.heading("size", text="大小")
         tree.heading("status", text="狀態")
-        tree.column("path", width=600)
-        tree.column("status", width=100, anchor=tk.CENTER)
+        
+        tree.column("path", width=450)
+        tree.column("size", width=100, anchor=tk.CENTER)
+        tree.column("status", width=120, anchor=tk.CENTER)
         
         scrollbar = ttk.Scrollbar(top, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscroll=scrollbar.set)
@@ -606,22 +675,25 @@ class AppUI(tk.Tk):
                 tree.delete(iid)
                 self.file_list = [item for item in self.file_list if item['id'] != iid]
                 
-        ttk.Button(toolbar, text="🗑️ 移除選取項目", command=remove_selected_from_dialog).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text="移除選取項目", command=remove_selected_from_dialog).pack(side=tk.LEFT)
         tree.bind("<Delete>", remove_selected_from_dialog)
         
-        # Populate tree
         for item in self.file_list:
-            tree.insert("", tk.END, iid=item['id'], values=(item['path'], item.get('status', '等待中')))
+            tree.insert("", tk.END, iid=item['id'], values=(item['path'], item.get('size', '未知'), item.get('status', '等待中')))
 
-        def on_confirm():
-            top.destroy()
-            self._execute_conversion()
-
-        # Bottom buttons
         btn_frame = ttk.Frame(top)
         btn_frame.pack(fill=tk.X, pady=10)
-        ttk.Button(btn_frame, text="✅ 確認並開始轉檔", command=on_confirm).pack(side=tk.RIGHT, padx=10)
-        ttk.Button(btn_frame, text="❌ 取消", command=top.destroy).pack(side=tk.RIGHT, padx=10)
+        
+        def on_confirm():
+            top.destroy()
+            if self.file_list:
+                self.log_text.config(state='normal')
+                self.log_text.delete('1.0', tk.END)
+                self.log_text.config(state='disabled')
+                self._execute_conversion()
+
+        tk.Button(btn_frame, text="確認轉檔", command=on_confirm, font=self.custom_font, bg="#d4edda", padx=10, pady=5).pack(side=tk.RIGHT, padx=10)
+        tk.Button(btn_frame, text="取消", command=top.destroy, font=self.custom_font, bg="#f8d7da", padx=10, pady=5).pack(side=tk.RIGHT, padx=5)
 
     def _execute_conversion(self):
         if not self.file_list:
@@ -637,12 +709,14 @@ class AppUI(tk.Tk):
             item['status'] = "處理中..."
         
         self.status_var.set("轉檔中，請稍候...")
+        self.progress_var.set(0)
         self.append_log("\n=== 開始轉檔 ===")
         
         actual_format = self.format_var.get()
         if actual_format == "advanced":
             actual_format = self.adv_format_var.get()
             
+        self.engine.max_workers = getattr(self, "max_workers", max(1, int((os.cpu_count() or 1) * 0.75)))
         threading.Thread(target=self.engine.run_batch, args=(
             self.file_list, actual_format, self.vol_var.get(), self.out_dir_var.get()
         ), daemon=True).start()
@@ -657,23 +731,31 @@ class AppUI(tk.Tk):
         self.after(0, self._process_update, msg_type, content)
 
     def _process_update(self, msg_type, content):
-        if msg_type == "SUCCESS":
+        if msg_type == "START":
             path = next((item['path'] for item in self.file_list if item['id'] == content), content)
-            self.append_log(f"✅ 成功: {os.path.basename(path)}")
-            self.file_list = [item for item in self.file_list if item['id'] != content]
+            self.append_log(f"[開始] 正在處理: {os.path.basename(path)}")
+        elif msg_type == "SUCCESS":
+            item_id, msg = content
+            path = next((item['path'] for item in self.file_list if item['id'] == item_id), item_id)
+            self.append_log(f"[成功] {os.path.basename(path)}")
+            self.file_list = [item for item in self.file_list if item['id'] != item_id]
         elif msg_type == "FAIL":
-            path = next((item['path'] for item in self.file_list if item['id'] == content), content)
-            self.append_log(f"❌ 失敗: {os.path.basename(path)}")
+            item_id, msg = content
+            path = next((item['path'] for item in self.file_list if item['id'] == item_id), item_id)
+            self.append_log(f"[失敗] {os.path.basename(path)} - 原因: {msg}")
             for item in self.file_list:
-                if item['id'] == content:
-                    item['status'] = '❌ 失敗'
+                if item['id'] == item_id:
+                    item['status'] = '失敗'
         elif msg_type == "PROGRESS":
-            self.status_var.set(f"轉檔進度: {content}")
+            processed, total = content
+            self.status_var.set(f"轉檔進度: {processed} / {total}")
+            if total > 0:
+                self.progress_var.set((processed / total) * 100)
         elif msg_type == "ERROR":
-            self.append_log(f"⚠️ 錯誤: {content}")
+            self.append_log(f"錯誤: {content}")
             messagebox.showerror("錯誤", content)
         elif msg_type == "PAUSE_REQUEST":
-            self.append_log(f"⏸️ 發生 I/O 錯誤，暫停中: {content}")
+            self.append_log(f"發生 I/O 錯誤，暫停中: {content}")
             self.show_io_error_dialog(content)
 
     def show_io_error_dialog(self, msg):
