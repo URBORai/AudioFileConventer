@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import time
 import datetime
@@ -153,7 +153,6 @@ class FileUtils:
             return os.path.join(sys._MEIPASS, filename)
         return filename
 
-    @staticmethod
     @staticmethod
     def format_size(size_bytes):
         if size_bytes == 0:
@@ -338,7 +337,7 @@ class ConverterEngine:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
             for item in file_list:
-                futures[executor.submit(self.convert_single_file, item, out_format, auto_vol, batch_out_dir, getattr(item, 'base_dir', None))] = item
+                futures[executor.submit(self.convert_single_file, item, out_format, auto_vol, batch_out_dir, item.get('base_dir'))] = item
 
             for future in as_completed(futures):
                 item = futures[future]
@@ -660,11 +659,17 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         top.transient(self)
         top.grab_set()
 
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
         toolbar = ttk.Frame(top)
-        toolbar.pack(fill=tk.X, padx=10, pady=5)
+        toolbar.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        
+        tree_frame = ttk.Frame(top)
+        tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         
         columns = ("path", "size", "status")
-        tree = ttk.Treeview(top, columns=columns, show="headings", selectmode="extended")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
         tree.heading("path", text="檔案路徑")
         tree.heading("size", text="大小")
         tree.heading("status", text="狀態")
@@ -673,11 +678,11 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         tree.column("size", width=100, anchor=tk.CENTER)
         tree.column("status", width=120, anchor=tk.CENTER)
         
-        scrollbar = ttk.Scrollbar(top, orient=tk.VERTICAL, command=tree.yview)
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
         tree.configure(yscroll=scrollbar.set)
         
-        tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         def remove_selected_from_dialog(event=None):
             selected = tree.selection()
@@ -690,9 +695,6 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         
         for item in self.file_list:
             tree.insert("", tk.END, iid=item['id'], values=(item['path'], item.get('size', '未知'), item.get('status', '等待中')))
-
-        btn_frame = ttk.Frame(top)
-        btn_frame.pack(fill=tk.X, pady=10)
         
         def on_confirm():
             top.destroy()
@@ -778,8 +780,11 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         top.attributes("-topmost", True)
         top.grab_set()
 
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(side=tk.BOTTOM, pady=20)
+
         lbl = ttk.Label(top, text=msg + "\n\n請將隨身碟插回，或排除問題後點擊繼續。", foreground="red", justify=tk.CENTER)
-        lbl.pack(expand=True, fill=tk.BOTH, padx=20, pady=20)
+        lbl.pack(side=tk.TOP, expand=True, fill=tk.BOTH, padx=20, pady=20)
 
         def resume():
             pause_event.set()
@@ -790,8 +795,6 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
             pause_event.set()
             top.destroy()
 
-        btn_frame = ttk.Frame(top)
-        btn_frame.pack(pady=20)
         ttk.Button(btn_frame, text="✅ 我已插好，繼續執行", command=resume).pack(side=tk.LEFT, padx=10, ipady=10)
         ttk.Button(btn_frame, text="❌ 放棄本次任務", command=abort).pack(side=tk.LEFT, padx=10, ipady=10)
 
@@ -816,7 +819,14 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
                 WinAPIUtils.show_toast("轉檔完成 (部分失敗)", "請查看桌面失敗清單報告。")
 
     def export_failed_report(self):
-        desktop = os.path.join(os.path.join(os.environ['USERPROFILE']), 'Desktop')
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+                desktop = winreg.QueryValueEx(key, "Desktop")[0]
+                if '%USERPROFILE%' in desktop:
+                    desktop = desktop.replace('%USERPROFILE%', os.environ.get('USERPROFILE', ''))
+        except Exception:
+            desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         report_path = os.path.join(desktop, f"轉檔失敗清單_{timestamp}.txt")
         try:
@@ -828,7 +838,7 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
             pass
 
     def retry_failed(self):
-        retry_list = [item for item in self.file_list if item.get('status') == '❌ 失敗']
+        retry_list = [item for item in self.file_list if item.get('status') == '失敗']
         
         self.file_list = retry_list
         for item in self.file_list:
@@ -837,7 +847,7 @@ class AppUI(TkinterDnD.Tk if has_dnd else tk.Tk):
         self.show_confirmation_dialog()
 
     def on_closing(self):
-        if not self.btn_start.instate(['!disabled']): # 正在轉檔
+        if self.btn_start.instate(['disabled']): # 正在轉檔
             if not messagebox.askyesno("警告", "轉檔正在進行中，確定要強制關閉程式嗎？\n這將會中斷所有進度！"):
                 return
             stop_event.set()
